@@ -132,24 +132,45 @@ impl AtomicBitmap {
 
     /// Atomically get and reset the dirty page bitmap.
     pub fn get_and_reset(&self) -> Vec<u64> {
-        self.map
-            .iter()
-            .map(|u| {
-                // Only perform the expensive read-modify-write when the word actually has
-                // dirty bits. Bitmaps are typically sparse, so the plain load is the common
-                // case. This improves performance significantly (5-10x).
-                //
-                // No dirty bit can get lost: a concurrent write is either observed by the
-                // swap and reported by this call, or happens after a zero load and remains
-                // set for the next call. This is the same race that already exists between
-                // individual words.
-                if u.load(Ordering::Relaxed) == 0 {
-                    0
-                } else {
-                    u.swap(0, Ordering::SeqCst)
-                }
-            })
-            .collect()
+        /// Typical size on x86_64, ARM, and RISCV (industry convention).
+        const CACHE_LINE_SIZE: usize = 64;
+        const WORDS_PER_LINE: usize = CACHE_LINE_SIZE / size_of::<AtomicU64>();
+
+        let mut out = Vec::with_capacity(self.map.len());
+
+        // Processes a chunk (normally a whole cache line) and either ignores
+        // all or takes all. This brings significant (5x) performance
+        // improvements for sparse maps without regressions for dense bitmaps.
+        let mut process_chunk = |chunk: &[AtomicU64]| {
+            // We use fold() over any() to prevent branching
+            let any_bit_set = chunk.iter().fold(0, |acc, atomic_word| {
+                acc | atomic_word.load(Ordering::Relaxed)
+            });
+            if any_bit_set != 0 {
+                // Extend all items while replacing each original word with a
+                // zero.
+                let swap_iter = chunk
+                    .iter()
+                    .map(|atomic_word| atomic_word.swap(0, Ordering::SeqCst));
+                out.extend(swap_iter);
+            } else {
+                out.resize(out.len() + chunk.len(), 0);
+            }
+        };
+
+        // First process the potentially unaligned head, then chunks of CACHE_LINE_SIZE.
+        let head_len = self
+            .map
+            .as_ptr()
+            .align_offset(CACHE_LINE_SIZE)
+            .min(self.map.len());
+        let (head, tail) = self.map.split_at(head_len);
+        if !head.is_empty() {
+            process_chunk(head);
+        }
+        tail.chunks(WORDS_PER_LINE).for_each(&mut process_chunk);
+
+        out
     }
 
     /// Reset all bitmap bits to 0.
